@@ -196,47 +196,46 @@ class Context:
 
 def update_portfolio(curMarket: Market, curPortfolio: Portfolio, context: Context):
     """
-    Main trading strategy:
-    - Maintain price + return history
-    - Compute:
-        * N-day momentum (cross-sectional)
-        * Short/long EMA trend strength
-        * Rolling volatility
-    - Build a combined score per stock:
-        score = (w_mom * norm_momentum + w_ema * norm_ema_diff) * vol_penalty
-    - Hold up to `top_k` highest-score stocks, with at most `max_invest_frac`
-      of the portfolio invested, and rebalance only when |weight_diff| exceeds
-      `rebalance_band` to reduce fee drag.
+    Strategy:
+    - Track price + return history.
+    - Compute N-day momentum for each stock.
+    - Use EMA_Calculations to maintain short/long EMAs.
+    - Eligible longs = stocks with:
+        * positive N-day momentum AND
+        * short EMA > long EMA (uptrend filter).
+    - Allocate up to max_invest_frac equally across top_k eligible stocks.
+    - Rebalance only when |weight_diff| > rebalance_band to reduce fee drag.
     """
 
-    # ---------- 1. One-time initialization of extra strategy parameters ----------
-    if not hasattr(context, "initialized_combo"):
-        context.initialized_combo = True
+    # ---------- 0. One-time initialization of hyperparameters ----------
+    if not hasattr(context, "initialized_mom_ema"):
+        context.initialized_mom_ema = True
 
-        # Momentum lookback window (in days)
-        context.mom_window = 40  # you can tune this
+        # Momentum lookback window (days)
+        context.mom_window = 40     # you can tune (e.g. 20, 40)
 
-        # Portfolio-level parameters
-        context.max_invest_frac = 0.80   # at most 80% of portfolio invested
-        context.top_k = 2                # number of top combined-score stocks to hold
-        context.rebalance_band = 0.40    # only trade if |weight_diff| > 40%
+        # Portfolio parameters
+        context.max_invest_frac = 0.80   # invest at most 80% of portfolio
+        context.top_k = 2                # hold up to 2 names
+        context.rebalance_band = 0.05    # only trade if |weight_diff| > 5%
 
-        # If your Context didn't already have these, make sure they exist
+        # Make sure required structures exist (Context __init__ likely already did this)
         if not hasattr(context, "price_history"):
-            context.price_history = {stock: [] for stock in curMarket.stocks.keys()}
+            context.price_history = {stock: [] for stock in curMarket.stocks}
         if not hasattr(context, "returns_history"):
-            context.returns_history = {stock: [] for stock in curMarket.stocks.keys()}
-        if not hasattr(context, "volatility_history"):
-            context.volatility_history = {stock: [] for stock in curMarket.stocks.keys()}
-        if not hasattr(context, "short_ema"):
+            context.returns_history = {stock: [] for stock in curMarket.stocks}
+        if not hasattr(context, "short_period"):
             context.short_period = 20
+        if not hasattr(context, "long_period"):
             context.long_period = 100
-            context.short_ema = {stock: [] for stock in curMarket.stocks.keys()}
-            context.long_ema  = {stock: [] for stock in curMarket.stocks.keys()}
+        if not hasattr(context, "short_ema"):
+            context.short_ema = {stock: [] for stock in curMarket.stocks}
+        if not hasattr(context, "long_ema"):
+            context.long_ema = {stock: [] for stock in curMarket.stocks}
         if not hasattr(context, "day"):
             context.day = 0
 
-    # ---------- 2. Update price & return history for today ----------
+    # ---------- 1. Update price & return history ----------
     for stock in curMarket.stocks:
         price = curMarket.stocks[stock]
         context.price_history[stock].append(price)
@@ -252,84 +251,63 @@ def update_portfolio(curMarket: Market, curPortfolio: Portfolio, context: Contex
 
     context.day += 1
 
-    # ---------- 3. Update EMAs & rolling volatility ----------
-    # Use your existing helper functions
+    # ---------- 2. Update EMAs using team helper ----------
+    # This should be defined globally in your file:
+    # def EMA_Calculations(curMarket: Market, context: Context): ...
     EMA_Calculations(curMarket, context)
-    vol_dict = rolling_std(curMarket, context, period=20)  # 20-day vol
 
-    # ---------- 4. Compute N-day momentum ----------
-    momentum_raw = {}   # stock -> raw momentum
+    # ---------- 3. Check that we have enough history for momentum ----------
     N = context.mom_window
+    any_stock = next(iter(context.price_history))
+    if len(context.price_history[any_stock]) <= N:
+        # Not enough data yet to compute N-day momentum → skip trading
+        return
+
+    # ---------- 4. Compute N-day momentum for each stock ----------
+    momentum = {}  # stock -> momentum value
     for stock, prices in context.price_history.items():
-        if len(prices) > N:
-            p_t = prices[-1]
-            p_past = prices[-(N + 1)]
-            if p_past > 0:
-                mom = (p_t / p_past) - 1.0
-            else:
-                mom = 0.0
+        p_t = prices[-1]
+        p_past = prices[-(N + 1)]
+        if p_past > 0:
+            mom = (p_t / p_past) - 1.0
         else:
             mom = 0.0
-        momentum_raw[stock] = mom
+        momentum[stock] = mom
 
-    # ---------- 5. Compute EMA trend strength (short - long) ----------
-    ema_raw = {}  # stock -> EMA diff
+    # ---------- 5. Determine which stocks pass the EMA uptrend filter ----------
+    ema_ok = {}  # stock -> bool (short_ema > long_ema?)
     for stock in curMarket.stocks:
         s_list = context.short_ema[stock]
         l_list = context.long_ema[stock]
         if len(s_list) == 0 or len(l_list) == 0:
-            ema_raw[stock] = 0.0
+            ema_ok[stock] = False
         else:
-            ema_raw[stock] = s_list[-1] - l_list[-1]
+            ema_ok[stock] = (s_list[-1] > l_list[-1])
 
-    # If we don't have enough EMA history yet, skip trading
-    if all(v == 0.0 for v in ema_raw.values()) and context.day < max(context.long_period, N) + 2:
-        return
+    # ---------- 6. Rank stocks by momentum, apply EMA filter & positivity ----------
+    sorted_by_mom = sorted(momentum.keys(), key=lambda s: momentum[s], reverse=True)
 
-    # ---------- 6. Normalize momentum and EMA into [0,1] per day ----------
-    def normalize_dict(d):
-        vals = list(d.values())
-        v_min = min(vals)
-        v_max = max(vals)
-        if v_max - v_min == 0:
-            return {k: 0.0 for k in d}
-        return {k: (v - v_min) / (v_max - v_min) for k, v in d.items()}
+    eligible = []
+    for stock in sorted_by_mom:
+        if momentum[stock] <= 0:
+            continue               # only consider positive momentum
+        if not ema_ok[stock]:
+            continue               # require short EMA > long EMA
+        eligible.append(stock)
 
-    norm_mom = normalize_dict(momentum_raw)
-    norm_ema = normalize_dict(ema_raw)
+    # ---------- 7. Set target weights ----------
+    target_weights = {stock: 0.0 for stock in curMarket.stocks}
 
-    # ---------- 7. Combine signals into a final score ----------
-    w_mom = 0.6
-    w_ema = 0.4
-    final_score = {}
-
-    for stock in curMarket.stocks:
-        m = norm_mom[stock]
-        e = norm_ema[stock]
-        vol = vol_dict.get(stock, 0.0)
-        vol_penalty = 1.0 / (1.0 + vol)  # higher vol -> smaller penalty factor
-
-        final_score[stock] = (w_mom * m + w_ema * e) * vol_penalty
-
-    # ---------- 8. Rank stocks by final score & set target weights ----------
-    sorted_stocks = sorted(final_score.keys(),
-                           key=lambda s: final_score[s],
-                           reverse=True)
-
-    target_weights = {stock: 0.0 for stock in curMarket.stocks.keys()}
-
-    # Only invest in stocks with positive score
-    positive = [s for s in sorted_stocks if final_score[s] > 0]
-    if len(positive) > 0:
-        top_stocks = positive[: context.top_k]
+    if len(eligible) > 0:
+        top_names = eligible[: context.top_k]
         total_invest_w = context.max_invest_frac
-        per_stock_w = total_invest_w / len(top_stocks)
+        per_stock_w = total_invest_w / len(top_names)
 
-        for s in top_stocks:
+        for s in top_names:
             target_weights[s] = per_stock_w
-    # else: stay in cash
+    # else: stay in cash (all target weights = 0)
 
-    # ---------- 9. Compute current portfolio weights ----------
+    # ---------- 8. Compute current portfolio weights ----------
     def portfolio_value() -> float:
         total = curPortfolio.cash
         for stock_name, num_shares in curPortfolio.shares.items():
@@ -345,13 +323,13 @@ def update_portfolio(curMarket: Market, curPortfolio: Portfolio, context: Contex
         position_val = num_shares * curMarket.stocks[stock_name]
         current_weights[stock_name] = position_val / total_val if total_val > 0 else 0.0
 
-    # ---------- 10. Trade toward target weights (with rebalance band) ----------
-    for stock_name in curMarket.stocks.keys():
+    # ---------- 9. Trade toward target weights with rebalance band ----------
+    for stock_name in curMarket.stocks:
         w_current = current_weights.get(stock_name, 0.0)
         w_target = target_weights.get(stock_name, 0.0)
         weight_diff = w_target - w_current
 
-        # Skip small differences to avoid overtrading (fee drag)
+        # Skip small differences to avoid overtrading & fee drag
         if abs(weight_diff) < context.rebalance_band:
             continue
 
@@ -368,8 +346,7 @@ def update_portfolio(curMarket: Market, curPortfolio: Portfolio, context: Contex
                 try:
                     curPortfolio.buy(stock_name, shares_to_buy, curMarket)
                 except ValueError:
-                    # Not enough cash due to rounding / fee – skip
-                    pass
+                    pass  # rounding / fee issues
 
         elif dollar_change < 0:
             # SELL this stock
@@ -381,8 +358,7 @@ def update_portfolio(curMarket: Market, curPortfolio: Portfolio, context: Contex
                 try:
                     curPortfolio.sell(stock_name, shares_to_sell, curMarket)
                 except ValueError:
-                    # Selling slightly more than held due to rounding – skip
-                    pass
+                    pass  # rounding issues
 
 def EMA_Calculations(curMarket: Market, context: Context):
     """
