@@ -11,12 +11,12 @@ IMPORTANT:
 - Do not modify the Market or Portfolio class structures
 """
 
-import os
+#import os
 
-MOM_WINDOW = int(os.getenv("MOM_WINDOW", "60"))
-MAX_INVEST_FRAC = float(os.getenv("MAX_INVEST_FRAC", "80")) / 100.0
-TOP_K = int(os.getenv("TOP_K", "2"))
-REBALANCE_BAND = float(os.getenv("REBALANCE_BAND", "0.02"))
+#MOM_WINDOW = int(os.getenv("MOM_WINDOW", "40"))
+#MAX_INVEST_FRAC = float(os.getenv("MAX_INVEST_FRAC", "80")) / 100.0
+#TOP_K = int(os.getenv("TOP_K", "2"))
+#REBALANCE_BAND = float(os.getenv("REBALANCE_BAND", "0.4"))
 
 class Market:
     """
@@ -235,18 +235,18 @@ def update_portfolio(curMarket: Market, curPortfolio: Portfolio, context: Contex
         context.price_history = {stock: [] for stock in curMarket.stocks.keys()}
 
         ###
-        context.mom_window = MOM_WINDOW
-        context.max_invest_frac = MAX_INVEST_FRAC
-        context.top_k = TOP_K
-        context.rebalance_band = REBALANCE_BAND
+        #context.mom_window = MOM_WINDOW
+        #context.max_invest_frac = MAX_INVEST_FRAC
+        #context.top_k = TOP_K
+        #context.rebalance_band = REBALANCE_BAND
 
         # Momentum lookback window (in days)
-        #context.mom_window = 40
+        context.mom_window = 40
 
         # Portfolio-level parameters
-        #context.max_invest_frac = 0.80      # at most 80% of portfolio invested
-        #context.top_k = 2                 # number of top momentum stocks to hold
-        #context.rebalance_band = REBALANCE_BAND      # only trade if |weight_diff| > 2%
+        context.max_invest_frac = 0.80      # at most 80% of portfolio invested
+        context.top_k = 2                 # number of top momentum stocks to hold
+        context.rebalance_band = 0.4      # only trade if |weight_diff| > 2%
 
         # Optional: track day count
         context.day = 0
